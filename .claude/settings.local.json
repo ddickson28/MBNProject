@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Lindsay/AppData/Local/Programs/Python/Python313/Lib/site-packages/mbnpy/**)"
+    ]
+  }
+}
