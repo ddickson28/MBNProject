@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Read(//c/Users/Lindsay/AppData/Local/Programs/Python/Python313/Lib/site-packages/mbnpy/**)"
+      "Read(//c/Users/Lindsay/AppData/Local/Programs/Python/Python313/Lib/site-packages/mbnpy/**)",
+      "Bash(powershell -Command \"Get-Item 'c:\\\\Users\\\\Lindsay\\\\OneDrive\\\\Desktop\\\\R&D\\\\BN Coding\\\\MBNProject\\\\TBNpy' | Format-List Name,Mode,Length,Extension\")",
+      "Bash(powershell -Command \"Rename-Item -Path 'c:\\\\Users\\\\Lindsay\\\\OneDrive\\\\Desktop\\\\R&D\\\\BN Coding\\\\MBNProject\\\\TBNpy' -NewName 'TBN.py'\")",
+      "Bash(powershell -Command \"Get-Item 'c:\\\\Users\\\\Lindsay\\\\OneDrive\\\\Desktop\\\\R&D\\\\BN Coding\\\\MBNProject\\\\TBN.py' | Format-List Name,Length,Extension\")",
+      "Bash(powershell -Command \"py -3.13 -c 'import sys; print\\(sys.executable\\); print\\(sys.version\\)'\")",
+      "Bash(powershell -Command \"if \\(Test-Path 'c:\\\\Users\\\\Lindsay\\\\OneDrive\\\\Desktop\\\\R&D\\\\BN Coding\\\\tbnpy'\\) { Write-Output 'EXISTS' } else { Write-Output 'OK_TO_CLONE' }\")",
+      "Bash(powershell -Command \"Set-Location 'c:\\\\Users\\\\Lindsay\\\\OneDrive\\\\Desktop\\\\R&D\\\\BN Coding'; git clone https://github.com/jieunbyun/tbnpy.git\")"
     ]
   }
 }
