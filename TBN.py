@@ -4,8 +4,7 @@ from torch.distributions import HalfNormal
 
 # One-sided truncated Normal on [0, +inf). PyTorch has no built-in TruncatedNormal
 # distribution object, so this is implemented via the parent Normal's cdf/icdf.
-# log_prob returns -inf for x < 0 so MCMC proposals into the negative half are
-# rejected cleanly instead of crashing.
+
 class TruncNormalPos:
     def __init__(self, loc, scale, validate_args=False):
         self.base = Normal(loc, scale, validate_args=validate_args)
@@ -141,22 +140,19 @@ class Lx:
 
 #Continuous - Total Loading | Weather, Cargo
 class Tx:
-    def __init__(self, childs, parents, sigma=0.6, device="cpu"):
+    def __init__(self, childs, parents, device="cpu"):
         """
-        Tx | Wx,Lx ~ TruncNormal(loc=Wx+Lx, scale=sigma, low=0, high=+inf)
-        i.e. Normal(Wx + Lx, sigma^2) restricted to the non-negative reals.
+        Tx = Wx + Lx  (deterministic; no added noise)
+
+        All randomness in Tx comes from its parents Wx and Lx.
 
         childs  : [Variable Tx]
         parents : [Variable Wx, Variable Lx]
-        sigma   : fixed noise std (float)
         """
         self.childs = childs
         self.parents = parents
         self.device = device
 
-        self.sigma = float(sigma)
-
-        # parent variables
         self.Wx = parents[0]
         self.Lx = parents[1]
 
@@ -170,20 +166,16 @@ class Tx:
 
         Returns
         -------
-        Cs   : (n_sample,) sampled Tx values
-        logp : (n_sample,) log p(Tx | Wx,Lx)
+        Cs   : Wx + Lx = Tx values
+        logp : log p(Tx | Wx,Lx)
         """
         Cs_pars = Cs_pars.to(self.device)
 
         Wx_val = Cs_pars[:, 0]
         Lx_val = Cs_pars[:, 1]
 
-        mean = Wx_val + Lx_val
-        std = torch.full_like(mean, self.sigma)
-
-        dist = TruncNormalPos(mean, std)
-        Cs = dist.sample()
-        logp = dist.log_prob(Cs)
+        Cs = Wx_val + Lx_val
+        logp = torch.zeros_like(Cs)
 
         return Cs, logp
 
@@ -198,18 +190,19 @@ class Tx:
         Returns
         -------
         log p(Tx | Wx,Lx) : (n_sample,)
+            0    where Tx ≈ Wx + Lx (constraint satisfied)
+            -inf where Tx ≠ Wx + Lx (constraint violated)
         """
         Cs = Cs.to(self.device)
 
-        C_val = Cs[:, 0]
+        C_val  = Cs[:, 0]
         Wx_val = Cs[:, 1]
         Lx_val = Cs[:, 2]
 
-        mean = Wx_val + Lx_val
-        std = torch.full_like(mean, self.sigma)
-
-        dist = TruncNormalPos(mean, std)
-        return dist.log_prob(C_val)
+        on_surface = torch.isclose(C_val, Wx_val + Lx_val)
+        return torch.where(on_surface,
+                           torch.zeros_like(C_val),
+                           torch.full_like(C_val, -float("inf")))
 
 #Continuous - Cumulative damage at time 0
 class Cx0:
@@ -403,19 +396,18 @@ class Clx:
 
 #Continuous - Resistance Rx|Z Rx = 1 + Zx
 class Rx:
-    def __init__(self, childs, parents, sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents, device="cpu"):
         """
-        Rx | Zx ~ Normal(Zx + 1, sigma^2)
+        Rx = exp(Zx)  (deterministic; log-normal w.r.t. a Normal Zx)
+
+        Always positive regardless of the sign of Zx.
 
         childs  : [Variable Rx]
         parents : [Variable Zx]
-        sigma   : fixed noise std (float)
         """
         self.childs = childs
         self.parents = parents
         self.device = device
-
-        self.sigma = float(sigma)
 
         # parent variables
         self.Zx = parents[0]
@@ -424,25 +416,20 @@ class Rx:
 
     def sample(self, Cs_pars):
         """
-        Cs_pars : (N, 2)
-            Cs_pars[:,0] = Zx index
-
+        Cs_pars : (N, 1)
+            Cs_pars[:,0] = Zx value
 
         Returns
         -------
-        Cs   : (N,) sampled Rx values
-        logp : (N,) log p(Rx | Zx)
+        Cs   : (N,) Rx values (= exp(Zx))
+        logp : (N,) log p(Rx | Zx) — zero, deterministic node
         """
         Cs_pars = Cs_pars.to(self.device)
 
         Zx_val = Cs_pars[:, 0]
 
-        mean = Zx_val + 1
-        std = torch.full_like(mean, self.sigma)
-
-        dist = Normal(mean, std)
-        Cs = dist.sample()
-        logp = dist.log_prob(Cs)
+        Cs   = torch.exp(Zx_val)
+        logp = torch.zeros_like(Cs)
 
         return Cs, logp
 
@@ -451,39 +438,43 @@ class Rx:
         """
         Cs : (N, 2)
             Cs[:,0] = Rx value
-            Cs[:,1] = Zx index
+            Cs[:,1] = Zx value
 
         Returns
         -------
         log p(Rx | Zx) : (N,)
+            0    where Rx ≈ exp(Zx) (constraint satisfied)
+            -inf otherwise
         """
         Cs = Cs.to(self.device)
 
-        C_val = Cs[:, 0]
+        C_val  = Cs[:, 0]
         Zx_val = Cs[:, 1]
 
-        mean = Zx_val + 1
-        std = torch.full_like(mean, self.sigma)
-
-        dist = Normal(mean, std)
-        return dist.log_prob(C_val)
+        expected = torch.exp(Zx_val)
+        on_surface = torch.isclose(C_val, expected)
+        return torch.where(on_surface,
+                           torch.zeros_like(C_val),
+                           torch.full_like(C_val, -float("inf")))
 
 #Continuous - Auxiliary variable Zx | Ux, Vx
 class Zx:
-    def __init__(self, childs, parents, sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents, rho=0.2, device="cpu"):
         """
-        Zx | Ux, Vx ~ TruncNormal(loc=Ux+Vx, scale=sigma, low=0, high=+inf)
-        i.e. Normal(Ux + Vx, sigma^2) restricted to the non-negative reals.
+        Zx = sqrt(1 - rho**2) * Vx + rho * Ux  (deterministic; no added noise)
+
+        All randomness in Zx comes from its parents Ux and Vx.
 
         childs  : [Variable Zx]
         parents : [Variable Ux, Variable Vx]
-        sigma   : fixed noise std (float)
+        rho     : correlation coefficient (float), default 0.2
         """
         self.childs = childs
         self.parents = parents
         self.device = device
 
-        self.sigma = float(sigma)
+        self.rho = float(rho)
+        self._a  = (1.0 - self.rho ** 2) ** 0.5   # coefficient on Vx
 
         # parent variables
         self.Ux = parents[0]
@@ -499,20 +490,16 @@ class Zx:
 
         Returns
         -------
-        Cs   : (n_sample,) sampled Zx values
-        logp : (n_sample,) log p(Zx | Ux,Vx)
+        Cs   : (n_sample,) Zx values (= sqrt(1-rho**2)*Vx + rho*Ux)
+        logp : (n_sample,) log p(Zx | Ux,Vx) — zero, deterministic node
         """
         Cs_pars = Cs_pars.to(self.device)
 
         Ux_val = Cs_pars[:, 0]
         Vx_val = Cs_pars[:, 1]
 
-        mean = Ux_val + Vx_val
-        std = torch.full_like(mean, self.sigma)
-
-        dist = TruncNormalPos(mean, std)
-        Cs = dist.sample()
-        logp = dist.log_prob(Cs)
+        Cs   = self._a * Vx_val + self.rho * Ux_val
+        logp = torch.zeros_like(Cs)
 
         return Cs, logp
 
@@ -527,28 +514,30 @@ class Zx:
         Returns
         -------
         log p(Zx | Ux,Vx) : (n_sample,)
+            0    where Zx ≈ sqrt(1-rho**2)*Vx + rho*Ux (constraint satisfied)
+            -inf otherwise
         """
         Cs = Cs.to(self.device)
 
-        C_val = Cs[:, 0]
+        C_val  = Cs[:, 0]
         Ux_val = Cs[:, 1]
         Vx_val = Cs[:, 2]
 
-        mean = Ux_val + Vx_val
-        std = torch.full_like(mean, self.sigma)
+        expected = self._a * Vx_val + self.rho * Ux_val
+        on_surface = torch.isclose(C_val, expected)
+        return torch.where(on_surface,
+                           torch.zeros_like(C_val),
+                           torch.full_like(C_val, -float("inf")))
 
-        dist = TruncNormalPos(mean, std)
-        return dist.log_prob(C_val)
-
-#Continuous - Latent unobserable gaussian correlates across locations
+#Continuous - Latent unobservable gaussian correlates across locations
 class Ux:
-    def __init__(self, childs, parents=[], sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], sigma=0.2, device="cpu"):
         """
-        Ux ~ HalfNormal(scale=sigma)    # equivalent to |N(0, sigma^2)|
+        Ux ~ Normal(0, sigma^2)
 
         childs  : [Variable Ux]
         parents : [empty]
-        sigma   : scale of the underlying Normal (float)
+        sigma   : noise std (float)
         """
         self.childs = childs
         self.parents = parents
@@ -568,9 +557,10 @@ class Ux:
         Cs   : (n_sample,) sampled Ux values
         logp : (n_sample,) log p(Ux)
         """
-        std = torch.full((n_sample,), self.sigma, device=self.device)
+        mean = torch.zeros(n_sample, device=self.device)
+        std  = torch.full((n_sample,), self.sigma, device=self.device)
 
-        dist = HalfNormal(std)
+        dist = Normal(mean, std)
 
         Cs = dist.sample()
         logp = dist.log_prob(Cs)
@@ -588,21 +578,21 @@ class Ux:
         """
         Cs = Cs.to(self.device)
 
-        std = torch.full_like(Cs, self.sigma)
+        mean = torch.zeros_like(Cs)
+        std  = torch.full_like(Cs, self.sigma)
 
-        dist = HalfNormal(std, validate_args=False)
-        logp = dist.log_prob(Cs)
-        return torch.where(Cs >= 0, logp, torch.full_like(logp, -float("inf")))
+        dist = Normal(mean, std)
+        return dist.log_prob(Cs)
 
 #Continuous - Latent unobservable gaussian unique to each location
 class Vx:
-    def __init__(self, childs, parents=[], sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], sigma=0.2, device="cpu"):
         """
-        Vx ~ HalfNormal(scale=sigma)    # equivalent to |N(0, sigma^2)|
+        Vx ~ Normal(0, sigma^2)
 
         childs  : [Variable Vx]
         parents : [empty]
-        sigma   : scale of the underlying Normal (float)
+        sigma   : noise std (float)
         """
         self.childs = childs
         self.parents = parents
@@ -622,9 +612,10 @@ class Vx:
         Cs   : (n_sample,) sampled Vx values
         logp : (n_sample,) log p(Vx)
         """
-        std = torch.full((n_sample,), self.sigma, device=self.device)
+        mean = torch.zeros(n_sample, device=self.device)
+        std  = torch.full((n_sample,), self.sigma, device=self.device)
 
-        dist = HalfNormal(std)
+        dist = Normal(mean, std)
 
         Cs = dist.sample()
         logp = dist.log_prob(Cs)
@@ -642,11 +633,11 @@ class Vx:
         """
         Cs = Cs.to(self.device)
 
-        std = torch.full_like(Cs, self.sigma)
+        mean = torch.zeros_like(Cs)
+        std  = torch.full_like(Cs, self.sigma)
 
-        dist = HalfNormal(std, validate_args=False)
-        logp = dist.log_prob(Cs)
-        return torch.where(Cs >= 0, logp, torch.full_like(logp, -float("inf")))
+        dist = Normal(mean, std)
+        return dist.log_prob(Cs)
 
 
 # Defining variables and probabilities
@@ -662,34 +653,32 @@ from tbnpy import cpt, variable
 import numpy as np
 import torch
 
-#import wx, lx, tx, cx
-
 device = ('cuda' if os.environ.get('USE_CUDA', '0') == '1' else 'cpu')
 
 def define_variables():
     varis = {}
 
-    varis['Wx'] = variable.Variable(name='Wx', values=(0, torch.inf))  # Continuous TBNpy truncate to 0 - + inf
+    varis['Wx'] = variable.Variable(name='Wx', values=(0, torch.inf))  # Continuous Half Normal
 
-    varis['Lx'] = variable.Variable(name='Lx', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Lx'] = variable.Variable(name='Lx', values=(0, torch.inf))  # Continuous Half Normal
 
-    varis['Tx'] = variable.Variable(name='Tx', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Tx'] = variable.Variable(name='Tx', values=(0, torch.inf))  # Continuous Half Normal
 
-    varis['Cx'] = variable.Variable(name='Cx', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Cx'] = variable.Variable(name='Cx', values=(0, torch.inf))  # Continuous Half Normal
 
-    varis['Px'] = variable.Variable(name='Px', values=['False', 'True']) # Boolean MBNpy & TBNpy
+    varis['Px'] = variable.Variable(name='Px', values=['False', 'True']) # Boolean 
 
-    varis['Cx0'] = variable.Variable(name='Cx0', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Cx0'] = variable.Variable(name='Cx0', values=(0, torch.inf))  # Continuous Half Normal
 
-    varis['Clx'] = variable.Variable(name='Clx', values=['False', 'True'])  # Boolean TBNpy
+    varis['Clx'] = variable.Variable(name='Clx', values=['False', 'True'])  # Boolean 
 
-    varis['Rx'] = variable.Variable(name='Rx', values=(0, torch.inf))  # Continuous TBNpy as above or should this be normal
+    varis['Rx'] = variable.Variable(name='Rx', values=(0, torch.inf))  # Continuous Log Normal
 
-    varis['Zx'] = variable.Variable(name='Zx', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Zx'] = variable.Variable(name='Zx', values=(-torch.inf, torch.inf))  # Continuous Normal
 
-    varis['Ux'] = variable.Variable(name='Ux', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Ux'] = variable.Variable(name='Ux', values=(-torch.inf, torch.inf))  # Continuous Normal
 
-    varis['Vx'] = variable.Variable(name='Vx', values=(0, torch.inf))  # Continuous TBNpy as above
+    varis['Vx'] = variable.Variable(name='Vx', values=(-torch.inf, torch.inf))  # Continuous Normal
 
     return varis
 
@@ -704,9 +693,9 @@ def define_probs(varis, device='cpu'):
 
     probs['Cx'] = Cx(childs=[varis['Cx']], parents=[varis['Tx'], varis['Px']], device=device)
 
-    probs['Px'] = cpt.Cpt(childs=[varis['Px']], C=np.array([[0], [1]]), p=np.array([1.0, 0.0]), device=device) #Has information
+    probs['Px'] = cpt.Cpt(childs=[varis['Px']], C=np.array([[0], [1]]), p=np.array([1.0, 0.0]), device=device) 
 
-    probs['Clx'] = Clx(childs=[varis['Clx']], parents=[varis['Cx'], varis['Rx']], device=device) #Add event matric C and probability vector p...?
+    probs['Clx'] = Clx(childs=[varis['Clx']], parents=[varis['Cx'], varis['Rx']], device=device) 
 
     probs['Cx0'] = Cx0(childs=[varis['Cx0']], device=device)
 
@@ -766,15 +755,6 @@ def define_evidence(n_evi=10, seed=123):
 
     return evidence
 
-# Needs updated
-
-#inference.sample(
-#    probs=probs,
-#    query_nodes=query_nodes,
-#    n_sample=n_sample,
-#    batch_size=50_000,
-#)
-
 def sample_prior(probs, variables, n_sample=5000):
     """
     Sample prior for all variables using forward sampling.
@@ -793,10 +773,6 @@ def sample_prior(probs, variables, n_sample=5000):
     dict[var_name -> np.ndarray]
         Each array has shape (n_sample,)
     """
-    # one dummy evidence row (no conditioning)
-    evidence = pd.DataFrame(index=[0])
-
-    # ensure variable list
     if isinstance(variables, dict):
         var_list = list(variables.values())
     else:
@@ -804,21 +780,21 @@ def sample_prior(probs, variables, n_sample=5000):
 
     query_nodes = [v.name for v in var_list]
 
-    probs_copy = inference.sample_evidence(
+    filled = inference.sample(
         probs=probs,
         query_nodes=query_nodes,
         n_sample=n_sample,
-        evidence_df=evidence,
     )
 
-    # container for prior samples
     prior = {}
-
-    for prob in probs_copy.values():
-        Cs = prob.Cs  # shape (1, n_sample, dim)
+    for prob in filled.values():
+        Cs = prob.Cs
         for j, child_var in enumerate(prob.childs):
             name = child_var.name
-            prior[name] = Cs[0, :, j].detach().cpu().numpy()
+            if Cs.ndim == 1:
+                prior[name] = Cs.detach().cpu().numpy()
+            else:                       # 2-D (n_sample, dim)
+                prior[name] = Cs[:, j].detach().cpu().numpy()
 
     return prior
 
@@ -879,8 +855,6 @@ def extract_posterior(sampler):
         posterior[v.name] = x.detach().cpu().numpy().reshape(-1)
 
     return posterior
-
-
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -968,7 +942,6 @@ def plot_prior_vs_posterior(prior, posterior, var, bins=60, fname: str = None):
     if fname is not None:
         plt.savefig(RESULTS / fname, dpi=300)
 
-
 if __name__ == "__main__":
     device = "cuda" if os.environ.get("USE_CUDA", "0") == "1" else "cpu"
 
@@ -976,7 +949,7 @@ if __name__ == "__main__":
     probs = define_probs(varis, device=device)
 
     # Prior distribution without evidence
-    prior = sample_prior(probs, varis, n_sample=10_000) # This needs to be replaed
+    prior = sample_prior(probs, varis, n_sample=10_000)
 
     # --- TEMP: forward inference only, skip MCMC below -------------------
     print("\nPrior summary (n=10,000 forward samples):")

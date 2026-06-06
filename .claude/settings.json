@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git show *)",
+      "Read(//tmp/**)",
+      "Bash(awk 'NR>=140 && NR<=210')"
+    ]
+  }
+}
