@@ -1,6 +1,7 @@
 import torch
 from torch.distributions import Normal
 from torch.distributions import HalfNormal
+from torch.distributions import Beta
 
 # One-sided truncated Normal on [0, +inf). PyTorch has no built-in TruncatedNormal
 # distribution object, so this is implemented via the parent Normal's cdf/icdf.
@@ -391,68 +392,128 @@ class Clx:
 
         return logp
 
-#Continuous - Resistance Rx|Z Rx = exp(Zx) (log-normal distribution with respect to Normal Zx)
+#Continuous - Resistance Rx
 class Rx:
     def __init__(self, childs, parents, device="cpu"):
         """
-        Rx = exp(Zx)  (deterministic; log-normal w.r.t. a Normal Zx)
+        t=0  (parents = [Zx]):
+            Rx = exp(Zx)
 
-        Always positive regardless of the sign of Zx.
+        t>=1 (parents = [Zx, Rx_prev, Qx]):
+            Rx = exp(Zx) - (Rx_prev - Qx)
 
         childs  : [Variable Rx]
-        parents : [Variable Zx]
+        parents : [Variable Zx] or [Variable Zx, Variable Rx_prev, Variable Qx]
         """
         self.childs = childs
         self.parents = parents
         self.device = device
 
-        # parent variables
-        self.Zx = parents[0]
+    # ------------------------------------------------------------------
+    def sample(self, Cs_pars):
+        Cs_pars = Cs_pars.to(self.device)
+        Zx_val = Cs_pars[:, 0]
+
+        if len(self.parents) == 1:
+            Cs = torch.exp(Zx_val)
+        else:
+            Rx_prev = Cs_pars[:, 1]
+            Qx_val  = Cs_pars[:, 2]
+            Cs = torch.exp(Zx_val) - (Rx_prev - Qx_val)
+
+        return Cs, torch.zeros_like(Cs)
 
     # ------------------------------------------------------------------
+    def log_prob(self, Cs):
+        Cs = Cs.to(self.device)
+        Rx_val = Cs[:, 0]
+        Zx_val = Cs[:, 1]
 
+        if len(self.parents) == 1:
+            expected = torch.exp(Zx_val)
+            is_valid = torch.isclose(Rx_val, expected)
+        else:
+            Rx_prev = Cs[:, 2]
+            Qx_val  = Cs[:, 3]
+            expected = torch.exp(Zx_val) - (Rx_prev - Qx_val)
+            is_valid = torch.isclose(Rx_val, expected, rtol=1e-5, atol=1e-8) & (Rx_val > 0)
+
+        return torch.where(is_valid,
+                           torch.zeros_like(Rx_val),
+                           torch.full_like(Rx_val, -float("inf")))
+
+#Continuous - Consumed resistance Qx | Rx_prev
+class Qx:
+    def __init__(self, childs, parents, alpha=191.0, beta_param=4.0, device='cpu'):
+        """
+        Qx ~ Beta(alpha, beta_param) scaled to [0, Rx_prev]
+
+        Models the portion of previous resistance consumed between inspections.
+        With Beta(191, 4), mean = 191/195 ≈ 0.979 — Qx is typically close to Rx_prev,
+        meaning most of the previous resistance is consumed each step.
+
+        childs:  [Variable Qx]
+        parents: [Variable Rx_prev]
+        """
+        self.childs = childs
+        self.parents = parents
+        self.device = device
+        self.alpha = float(alpha)
+        self.beta_param = float(beta_param)
+
+    # ------------------------------------------------------------------
     def sample(self, Cs_pars):
         """
         Cs_pars : (N, 1)
-            Cs_pars[:,0] = Zx value
+            Cs_pars[:,0] = Rx_prev value
 
         Returns
         -------
-        Cs   : (N,) Rx values (= exp(Zx))
-        logp : (N,) log p(Rx | Zx) — zero, deterministic node
+        Cs   : (N,) Qx = Rx_prev * B,  B ~ Beta(alpha, beta_param)
+        logp : (N,) log p(Qx | Rx_prev)  via change of variables
         """
         Cs_pars = Cs_pars.to(self.device)
+        Rx_prev = Cs_pars[:, 0]
 
-        Zx_val = Cs_pars[:, 0]
+        alpha = torch.full_like(Rx_prev, self.alpha)
+        beta  = torch.full_like(Rx_prev, self.beta_param)
 
-        Cs   = torch.exp(Zx_val)
-        logp = torch.zeros_like(Cs)
+        dist = Beta(alpha, beta)
+        B    = dist.sample()
+
+        Cs   = Rx_prev * B
+        logp = dist.log_prob(B) - torch.log(Rx_prev.clamp_min(1e-12))
 
         return Cs, logp
 
     # ------------------------------------------------------------------
-    def log_prob(self, Cs):
+    def log_prob(self, Cxs):
         """
-        Cs : (N, 2)
-            Cs[:,0] = Rx value
-            Cs[:,1] = Zx value
+        Cxs : (N, 2)
+            Cxs[:,0] = Qx value
+            Cxs[:,1] = Rx_prev value
 
         Returns
         -------
-        log p(Rx | Zx) : (N,)
-            0    where Rx ≈ exp(Zx) (constraint satisfied)
-            -inf otherwise
+        log p(Qx | Rx_prev) : (N,)
         """
-        Cs = Cs.to(self.device)
+        Cxs = Cxs.to(self.device)
 
-        C_val  = Cs[:, 0]
-        Zx_val = Cs[:, 1]
+        Qx_val  = Cxs[:, 0]
+        Rx_prev = Cxs[:, 1]
 
-        expected = torch.exp(Zx_val)
-        on_surface = torch.isclose(C_val, expected)
-        return torch.where(on_surface,
-                           torch.zeros_like(C_val),
-                           torch.full_like(C_val, -float("inf")))
+        B = (Qx_val / Rx_prev.clamp_min(1e-12)).clamp(1e-6, 1.0 - 1e-6)
+
+        alpha = torch.full_like(B, self.alpha)
+        beta  = torch.full_like(B, self.beta_param)
+
+        dist = Beta(alpha, beta)
+        logp = dist.log_prob(B) - torch.log(Rx_prev.clamp_min(1e-12))
+
+        valid = (Qx_val >= 0) & (Qx_val <= Rx_prev)
+        return torch.where(valid, logp, torch.full_like(logp, -float('inf')))
+
+
 
 #Continuous - Auxiliary variable Zx | Ux, Vx
 class Zx:
@@ -652,7 +713,7 @@ import torch
 
 device = ('cuda' if os.environ.get('USE_CUDA', '0') == '1' else 'cpu')
 
-def define_variables(n_locations=2, n_timesteps=2):
+def define_variables(n_locations=2, n_timesteps=5):
     varis = {}
 
     for loc in range(1, n_locations + 1):
@@ -669,6 +730,7 @@ def define_variables(n_locations=2, n_timesteps=2):
             varis[f'Px{loc}{t}']  = variable.Variable(name=f'Px{loc}{t}',  values=['False', 'True'])
             varis[f'Cx{loc}{t}']  = variable.Variable(name=f'Cx{loc}{t}',  values=(0, torch.inf))
             varis[f'Clx{loc}{t}'] = variable.Variable(name=f'Clx{loc}{t}', values=['False', 'True'])
+            varis[f'Qx{loc}{t}']  = variable.Variable(name=f'Qx{loc}{t}',  values=(0, torch.inf))
             varis[f'Rx{loc}{t}']  = variable.Variable(name=f'Rx{loc}{t}',  values=(0, torch.inf))
             varis[f'Zx{loc}{t}']  = variable.Variable(name=f'Zx{loc}{t}',  values=(-torch.inf, torch.inf))
             varis[f'Vx{loc}{t}']  = variable.Variable(name=f'Vx{loc}{t}',  values=(-torch.inf, torch.inf))
@@ -679,7 +741,7 @@ def define_variables(n_locations=2, n_timesteps=2):
 
     return varis
 
-def define_probs(varis, n_locations=2, n_timesteps=2, device='cpu'):
+def define_probs(varis, n_locations=2, n_timesteps=5, device='cpu'):
     probs = {}
 
     # Ux0: shared t=0 initialisation across all locations
@@ -726,9 +788,16 @@ def define_probs(varis, n_locations=2, n_timesteps=2, device='cpu'):
                 parents=[varis[f'Ux{t}'], varis[f'Vx{loc}{t}']],
                 device=device,
             )
+            # Qx: consumed resistance — Beta(191,4) scaled to [0, Rx{loc}{t-1}]
+            probs[f'Qx{loc}{t}']  = Qx(
+                childs=[varis[f'Qx{loc}{t}']],
+                parents=[varis[f'Rx{loc}{t-1}']],
+                device=device,
+            )
+            # Rx chains temporally: Rx{t} = exp(Zx{t}) - (Rx{t-1} - Qx{t})
             probs[f'Rx{loc}{t}']  = Rx(
                 childs=[varis[f'Rx{loc}{t}']],
-                parents=[varis[f'Zx{loc}{t}']],
+                parents=[varis[f'Zx{loc}{t}'], varis[f'Rx{loc}{t-1}'], varis[f'Qx{loc}{t}']],
                 device=device,
             )
             probs[f'Clx{loc}{t}'] = Clx(
@@ -980,7 +1049,7 @@ if __name__ == "__main__":
     device = "cuda" if os.environ.get("USE_CUDA", "0") == "1" else "cpu"
 
     n_locations = 2
-    n_timesteps = 2
+    n_timesteps = 5
 
     varis = define_variables(n_locations=n_locations, n_timesteps=n_timesteps)
     probs = define_probs(varis, n_locations=n_locations, n_timesteps=n_timesteps, device=device)
