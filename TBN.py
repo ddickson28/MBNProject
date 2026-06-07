@@ -258,15 +258,18 @@ class Cx0:
         logp = dist.log_prob(Cs)
         return torch.where(Cs >= 0, logp, torch.full_like(logp, -float("inf")))
 
-#Continuous - Cumulative damage | Total loading, Previous Repair
+#Continuous - Cumulative damage | Previous damage, Total loading, Repair flag
 class Cx:
     def __init__(self, childs, parents, device='cpu'):
         """
+        Cx{t} = Cx{t-1} + Tx  if Px == 0 (no repair)
+        Cx{t} = 0              if Px == 1 (repair resets damage)
 
-        childs: list [Cx]
-        parents: list [Tx, Px]
-            Tx: continuous-valued parent (tensor-like values for samples)
-            Px: binary parent (0 or 1)
+        childs:  list [Cx]
+        parents: list [Cx_prev, Tx, Px]
+            Cx_prev: continuous previous-timestep damage
+            Tx:      continuous total loading
+            Px:      binary repair flag (0 = no repair, 1 = repair)
         """
         self.childs = childs
         self.parents = parents
@@ -275,55 +278,49 @@ class Cx:
     # ------------------------------------------------------------------
     def sample(self, Cs_pars):
         """
-        Cs_pars: (N, 2)
-            Cs_pars[:,0] = Tx value   (float)
-            Cs_pars[:,1] = Px index   (0 or 1)
-        
+        Cs_pars: (N, 3)
+            Cs_pars[:,0] = Cx_prev value  (float)
+            Cs_pars[:,1] = Tx value       (float)
+            Cs_pars[:,2] = Px index       (0 or 1)
+
         Returns:
-            Cx samples (N,)
+            Cs   : (N,) Cx samples
+            logp : (N,) zeros  (deterministic node)
         """
         Cs_pars = Cs_pars.to(self.device)
 
-        Tx_val = Cs_pars[:, 0]
-        Px_idx = Cs_pars[:, 1].long()
+        Cx_prev = Cs_pars[:, 0]
+        Tx_val  = Cs_pars[:, 1]
+        Px_idx  = Cs_pars[:, 2].long()
 
-        # Cx = Tx if Px==0, else 0
-        Cs = torch.where(Px_idx == 0, Tx_val, torch.zeros_like(Tx_val))
+        Cs = torch.where(Px_idx == 0, Cx_prev + Tx_val, torch.zeros_like(Tx_val))
+        logp = torch.zeros(Cs_pars.shape[0], device=self.device)
 
-        # deterministic function, i.e. P(Cx | Tx, Px) = 1
-        n_sample = Cs_pars.shape[0]
-        ps = torch.log(torch.ones(n_sample,)).to(self.device)
-
-        return Cs, ps
+        return Cs, logp
 
     # ------------------------------------------------------------------
     def log_prob(self, Cxs):
         """
-        Cxs: shape (N, 3)
-            Cxs[:,0] = Cx value
-            Cxs[:,1] = Tx value 
-            Cxs[:,2] = Px state (0 or 1) 
-        
-        Returns:
-            log p(Cx | Tx, Px) of shape (N,)
-        """
+        Cxs: shape (N, 4)
+            Cxs[:,0] = Cx value      (child)
+            Cxs[:,1] = Cx_prev value (parent 0)
+            Cxs[:,2] = Tx value      (parent 1)
+            Cxs[:,3] = Px state      (parent 2: 0 or 1)
 
+        Returns:
+            log p(Cx | Cx_prev, Tx, Px) of shape (N,)
+        """
         Cxs = Cxs.to(self.device)
 
-        Cx_val = Cxs[:, 0]
-        Tx_val = Cxs[:, 1]
-        Px_idx = Cxs[:, 2].long()
+        Cx_val  = Cxs[:, 0]
+        Cx_prev = Cxs[:, 1]
+        Tx_val  = Cxs[:, 2]
+        Px_idx  = Cxs[:, 3].long()
 
-        # Deterministic rule: valid_Cx = Tx if Px==0 else 0
-        expected_Cx = torch.where(Px_idx == 0, Tx_val, torch.zeros_like(Tx_val))
+        expected = torch.where(Px_idx == 0, Cx_prev + Tx_val, torch.zeros_like(Tx_val))
+        is_valid = torch.isclose(Cx_val, expected, rtol=1e-5, atol=1e-8)
 
-        # Valid if Cx_val == expected_Cx
-        is_valid = torch.isclose(Cx_val, expected_Cx, rtol=1e-5, atol=1e-8) # Add some acceptable error margin for floating point comparisons if needed.
-
-        # log 1 = 0 for valid, log 0 = -inf for invalid
-        logp = torch.where(is_valid, torch.zeros_like(Cx_val), torch.full_like(Cx_val, -float("inf")))
-
-        return logp
+        return torch.where(is_valid, torch.zeros_like(Cx_val), torch.full_like(Cx_val, -float("inf")))
 
 #Continuous - Crack location  | Cumulative damage, Resistance
 class Clx:
@@ -394,7 +391,7 @@ class Clx:
 
         return logp
 
-#Continuous - Resistance Rx|Z Rx = 1 + Zx
+#Continuous - Resistance Rx|Z Rx = exp(Zx) (log-normal distribution with respect to Normal Zx)
 class Rx:
     def __init__(self, childs, parents, device="cpu"):
         """
@@ -655,58 +652,95 @@ import torch
 
 device = ('cuda' if os.environ.get('USE_CUDA', '0') == '1' else 'cpu')
 
-def define_variables():
+def define_variables(n_locations=2, n_timesteps=2):
     varis = {}
 
-    varis['Wx'] = variable.Variable(name='Wx', values=(0, torch.inf))  # Continuous Half Normal
+    for loc in range(1, n_locations + 1):
+        # t=0 initialisation nodes (per location)
+        varis[f'Cx{loc}0'] = variable.Variable(name=f'Cx{loc}0', values=(0, torch.inf))
+        varis[f'Vx{loc}0'] = variable.Variable(name=f'Vx{loc}0', values=(-torch.inf, torch.inf))
+        varis[f'Zx{loc}0'] = variable.Variable(name=f'Zx{loc}0', values=(-torch.inf, torch.inf))
+        varis[f'Rx{loc}0'] = variable.Variable(name=f'Rx{loc}0', values=(0, torch.inf))
 
-    varis['Lx'] = variable.Variable(name='Lx', values=(0, torch.inf))  # Continuous Half Normal
+        for t in range(1, n_timesteps + 1):
+            varis[f'Wx{loc}{t}']  = variable.Variable(name=f'Wx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Lx{loc}{t}']  = variable.Variable(name=f'Lx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Tx{loc}{t}']  = variable.Variable(name=f'Tx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Px{loc}{t}']  = variable.Variable(name=f'Px{loc}{t}',  values=['False', 'True'])
+            varis[f'Cx{loc}{t}']  = variable.Variable(name=f'Cx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Clx{loc}{t}'] = variable.Variable(name=f'Clx{loc}{t}', values=['False', 'True'])
+            varis[f'Rx{loc}{t}']  = variable.Variable(name=f'Rx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Zx{loc}{t}']  = variable.Variable(name=f'Zx{loc}{t}',  values=(-torch.inf, torch.inf))
+            varis[f'Vx{loc}{t}']  = variable.Variable(name=f'Vx{loc}{t}',  values=(-torch.inf, torch.inf))
 
-    varis['Tx'] = variable.Variable(name='Tx', values=(0, torch.inf))  # Continuous Half Normal
-
-    varis['Cx'] = variable.Variable(name='Cx', values=(0, torch.inf))  # Continuous Half Normal
-
-    varis['Px'] = variable.Variable(name='Px', values=['False', 'True']) # Boolean 
-
-    varis['Cx0'] = variable.Variable(name='Cx0', values=(0, torch.inf))  # Continuous Half Normal
-
-    varis['Clx'] = variable.Variable(name='Clx', values=['False', 'True'])  # Boolean 
-
-    varis['Rx'] = variable.Variable(name='Rx', values=(0, torch.inf))  # Continuous Log Normal
-
-    varis['Zx'] = variable.Variable(name='Zx', values=(-torch.inf, torch.inf))  # Continuous Normal
-
-    varis['Ux'] = variable.Variable(name='Ux', values=(-torch.inf, torch.inf))  # Continuous Normal
-
-    varis['Vx'] = variable.Variable(name='Vx', values=(-torch.inf, torch.inf))  # Continuous Normal
+    # Ux is shared across locations, one per timestep (including t=0)
+    for t in range(0, n_timesteps + 1):
+        varis[f'Ux{t}'] = variable.Variable(name=f'Ux{t}', values=(-torch.inf, torch.inf))
 
     return varis
 
-def define_probs(varis, device='cpu'):
+def define_probs(varis, n_locations=2, n_timesteps=2, device='cpu'):
     probs = {}
 
-    probs['Wx'] = Wx(childs=[varis['Wx']], device=device)
+    # Ux0: shared t=0 initialisation across all locations
+    probs['Ux0'] = Ux(childs=[varis['Ux0']], device=device)
 
-    probs['Lx'] = Lx(childs=[varis['Lx']], device=device)
+    for loc in range(1, n_locations + 1):
+        # t=0 initialisation chain per location: Ux0 + Vx{loc}0 → Zx{loc}0 → Rx{loc}0
+        probs[f'Cx{loc}0'] = Cx0(childs=[varis[f'Cx{loc}0']], device=device)
+        probs[f'Vx{loc}0'] = Vx(childs=[varis[f'Vx{loc}0']], device=device)
+        probs[f'Zx{loc}0'] = Zx(
+            childs=[varis[f'Zx{loc}0']],
+            parents=[varis['Ux0'], varis[f'Vx{loc}0']],
+            device=device,
+        )
+        probs[f'Rx{loc}0'] = Rx(
+            childs=[varis[f'Rx{loc}0']],
+            parents=[varis[f'Zx{loc}0']],
+            device=device,
+        )
 
-    probs['Tx'] = Tx(childs=[varis['Tx']], parents=[varis['Wx'], varis['Lx']] , device=device)
+        for t in range(1, n_timesteps + 1):
+            probs[f'Wx{loc}{t}']  = Wx(childs=[varis[f'Wx{loc}{t}']], device=device)
+            probs[f'Lx{loc}{t}']  = Lx(childs=[varis[f'Lx{loc}{t}']], device=device)
+            probs[f'Tx{loc}{t}']  = Tx(
+                childs=[varis[f'Tx{loc}{t}']],
+                parents=[varis[f'Wx{loc}{t}'], varis[f'Lx{loc}{t}']],
+                device=device,
+            )
+            probs[f'Px{loc}{t}']  = cpt.Cpt(
+                childs=[varis[f'Px{loc}{t}']],
+                C=np.array([[0], [1]]),
+                p=np.array([1.0, 0.0]),
+                device=device,
+            )
+            # Cx chains temporally: parent is Cx{loc}{t-1} (same location, previous step)
+            probs[f'Cx{loc}{t}']  = Cx(
+                childs=[varis[f'Cx{loc}{t}']],
+                parents=[varis[f'Cx{loc}{t-1}'], varis[f'Tx{loc}{t}'], varis[f'Px{loc}{t}']],
+                device=device,
+            )
+            probs[f'Vx{loc}{t}']  = Vx(childs=[varis[f'Vx{loc}{t}']], device=device)
+            probs[f'Zx{loc}{t}']  = Zx(
+                childs=[varis[f'Zx{loc}{t}']],
+                parents=[varis[f'Ux{t}'], varis[f'Vx{loc}{t}']],
+                device=device,
+            )
+            probs[f'Rx{loc}{t}']  = Rx(
+                childs=[varis[f'Rx{loc}{t}']],
+                parents=[varis[f'Zx{loc}{t}']],
+                device=device,
+            )
+            probs[f'Clx{loc}{t}'] = Clx(
+                childs=[varis[f'Clx{loc}{t}']],
+                parents=[varis[f'Cx{loc}{t}'], varis[f'Rx{loc}{t}']],
+                device=device,
+            )
 
-    probs['Cx'] = Cx(childs=[varis['Cx']], parents=[varis['Tx'], varis['Px']], device=device)
+    # Ux: one per timestep (t>=1), shared across locations
+    for t in range(1, n_timesteps + 1):
+        probs[f'Ux{t}'] = Ux(childs=[varis[f'Ux{t}']], device=device)
 
-    probs['Px'] = cpt.Cpt(childs=[varis['Px']], C=np.array([[0], [1]]), p=np.array([1.0, 0.0]), device=device) 
-
-    probs['Clx'] = Clx(childs=[varis['Clx']], parents=[varis['Cx'], varis['Rx']], device=device) 
-
-    probs['Cx0'] = Cx0(childs=[varis['Cx0']], device=device)
-
-    probs['Rx'] = Rx(childs=[varis['Rx']], parents=[varis['Zx']], device=device)
-
-    probs['Zx'] = Zx(childs=[varis['Zx']], parents=[varis['Ux'], varis['Vx']], device=device)
-
-    probs['Ux'] = Ux(childs=[varis['Ux']], device=device)
-
-    probs['Vx'] = Vx(childs=[varis['Vx']], device=device)
-    
     return probs
 
 # Inference
@@ -945,8 +979,11 @@ def plot_prior_vs_posterior(prior, posterior, var, bins=60, fname: str = None):
 if __name__ == "__main__":
     device = "cuda" if os.environ.get("USE_CUDA", "0") == "1" else "cpu"
 
-    varis = define_variables()
-    probs = define_probs(varis, device=device)
+    n_locations = 2
+    n_timesteps = 2
+
+    varis = define_variables(n_locations=n_locations, n_timesteps=n_timesteps)
+    probs = define_probs(varis, n_locations=n_locations, n_timesteps=n_timesteps, device=device)
 
     # Prior distribution without evidence
     prior = sample_prior(probs, varis, n_sample=10_000)
