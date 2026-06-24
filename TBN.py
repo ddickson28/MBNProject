@@ -27,7 +27,7 @@ class TruncNormalPos:
 
 #Continuous - Weather Loading
 class Wx:
-    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=0.2, device="cpu"):
         """
         Wx ~ Log-Normal(0, 1) # equivalent to exp(N(0, 1))
 
@@ -87,7 +87,7 @@ class Wx:
 
 #Continuous - Cargo Loading
 class Lx:
-    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=0.2, device="cpu"):
         """
         Lx ~ Log-Normal(mean, sigma) # equivalent to exp(N(mean, sigma^2))
 
@@ -459,7 +459,7 @@ class Rx:
 
 #Continuous - Initial resistance at t=0 (root, log-normal)
 class Rx0:
-    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=0.2, device="cpu"):
         """
         Rx0 ~ LogNormal(mean, sigma)  # equivalent to exp(N(mean, sigma^2))
 
