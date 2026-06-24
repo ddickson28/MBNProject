@@ -1,6 +1,7 @@
 import torch
 from torch.distributions import Normal
-from torch.distributions import HalfNormal
+from torch.distributions import LogNormal
+from torch.distributions import Beta
 
 # One-sided truncated Normal on [0, +inf). PyTorch has no built-in TruncatedNormal
 # distribution object, so this is implemented via the parent Normal's cdf/icdf.
@@ -26,9 +27,9 @@ class TruncNormalPos:
 
 #Continuous - Weather Loading
 class Wx:
-    def __init__(self, childs, parents=[], sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
         """
-        Wx ~ HalfNormal(0, Scale) Scale = Sigma^2
+        Wx ~ Log-Normal(0, 1) # equivalent to exp(N(0, 1))
 
         childs  : [Variable Wx]
         parents : [empty]
@@ -39,7 +40,7 @@ class Wx:
         self.parents = parents
         self.device = device
 
-    #    self.mean = float(mean)
+        self.mean = float(mean)
         self.sigma = float(sigma)
 
     # ------------------------------------------------------------------
@@ -55,11 +56,10 @@ class Wx:
         logp : (N,) log p(Wx)
         """
 
-    #    mean = torch.full((n_sample,), self.mean, device=self.device)
-        std = torch.full((n_sample,), self.sigma, device=self.device)    
-    #    std = torch.full_like(mean, self.sigma, device=self.device)
 
-        dist = HalfNormal(std)
+        std = torch.full((n_sample,), self.sigma, device=self.device)
+        mean = torch.full_like(std, self.mean)
+        dist = LogNormal(mean, std)
         Cs = dist.sample()
         logp = dist.log_prob(Cs)
 
@@ -80,26 +80,28 @@ class Wx:
 
         #    mean = torch.full_like(Cs, self.mean) 
         std = torch.full_like(Cs, self.sigma)
+        mean = torch.full_like(Cs, self.mean)
 
-        dist = HalfNormal(std)
+        dist = LogNormal(mean, std)
         return dist.log_prob(Wx_val)
 
 #Continuous - Cargo Loading
 class Lx:
-    def __init__(self, childs, parents=[], sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
         """
-        Lx ~ HalfNormal(scale=sigma)    # equivalent to |N(0, sigma^2)|
+        Lx ~ Log-Normal(mean, sigma) # equivalent to exp(N(mean, sigma^2))
 
         childs  : [Variable Lx]
         parents : [empty]
-        sigma   : scale of the underlying Normal (float)
+        mean    : mean of the underlying Normal (float)
+        sigma   : std of the underlying Normal (float)
         """
         self.childs = childs
         self.parents = parents
         self.device = device
 
+        self.mean  = float(mean)
         self.sigma = float(sigma)
-
 
     # ------------------------------------------------------------------
     def sample(self, n_sample):
@@ -112,11 +114,11 @@ class Lx:
         Cs   : (n_sample,) sampled Lx values
         logp : (n_sample,) log p(Lx)
         """
-        std = torch.full((n_sample,), self.sigma, device=self.device)
+        std  = torch.full((n_sample,), self.sigma, device=self.device)
+        mean = torch.full_like(std, self.mean)
 
-        dist = HalfNormal(std)
-
-        Cs = dist.sample()
+        dist = LogNormal(mean, std)
+        Cs   = dist.sample()
         logp = dist.log_prob(Cs)
 
         return Cs, logp
@@ -132,11 +134,11 @@ class Lx:
         """
         Cs = Cs.to(self.device)
 
-        std = torch.full_like(Cs, self.sigma)
+        std  = torch.full_like(Cs, self.sigma)
+        mean = torch.full_like(Cs, self.mean)
 
-        dist = HalfNormal(std, validate_args=False)
-        logp = dist.log_prob(Cs)
-        return torch.where(Cs >= 0, logp, torch.full_like(logp, -float("inf")))
+        dist = LogNormal(mean, std)
+        return dist.log_prob(Cs)
 
 #Continuous - Total Loading | Weather, Cargo
 class Tx:
@@ -204,39 +206,39 @@ class Tx:
                            torch.zeros_like(C_val),
                            torch.full_like(C_val, -float("inf")))
 
-#Continuous - Cumulative damage at time 0
+#Continuous - Cumulative damage at time 0 (root, log-normal)
 class Cx0:
-    def __init__(self, childs, parents=[], sigma=1.0, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
         """
-        Cx0 ~ HalfNormal(scale=sigma)    # equivalent to |N(0, sigma^2)|
+        Cx0 ~ LogNormal(mean, sigma)  # equivalent to exp(N(mean, sigma^2))
 
         childs  : [Variable Cx0]
         parents : [empty]
-        sigma   : scale of the underlying Normal (float)
+        mean    : mean of the underlying Normal (float)
+        sigma   : std of the underlying Normal (float)
         """
         self.childs = childs
         self.parents = parents
         self.device = device
 
+        self.mean  = float(mean)
         self.sigma = float(sigma)
 
     # ------------------------------------------------------------------
-
     def sample(self, n_sample):
         """
         n_sample : int
-            number of samples to draw
 
         Returns
         -------
         Cs   : (n_sample,) sampled Cx0 values
         logp : (n_sample,) log p(Cx0)
         """
+        std  = torch.full((n_sample,), self.sigma, device=self.device)
+        mean = torch.full_like(std, self.mean)
 
-        std = torch.full((n_sample,), self.sigma, device=self.device)
-
-        dist = HalfNormal(std)
-        Cs = dist.sample()
+        dist = LogNormal(mean, std)
+        Cs   = dist.sample()
         logp = dist.log_prob(Cs)
 
         return Cs, logp
@@ -244,7 +246,7 @@ class Cx0:
     # ------------------------------------------------------------------
     def log_prob(self, Cs):
         """
-        Cs : (n_sample, )
+        Cs : (n_sample,)
 
         Returns
         -------
@@ -252,21 +254,24 @@ class Cx0:
         """
         Cs = Cs.to(self.device)
 
-        std = torch.full_like(Cs, self.sigma)
+        std  = torch.full_like(Cs, self.sigma)
+        mean = torch.full_like(Cs, self.mean)
 
-        dist = HalfNormal(std, validate_args=False)
-        logp = dist.log_prob(Cs)
-        return torch.where(Cs >= 0, logp, torch.full_like(logp, -float("inf")))
+        dist = LogNormal(mean, std)
+        return dist.log_prob(Cs)
 
-#Continuous - Cumulative damage | Total loading, Previous Repair
+#Continuous - Cumulative damage | Previous damage, Total loading, Repair flag
 class Cx:
     def __init__(self, childs, parents, device='cpu'):
         """
+        Cx{t} = Cx{t-1} + Tx  if Px == 0 (no repair)
+        Cx{t} = 0              if Px == 1 (repair resets damage)
 
-        childs: list [Cx]
-        parents: list [Tx, Px]
-            Tx: continuous-valued parent (tensor-like values for samples)
-            Px: binary parent (0 or 1)
+        childs:  list [Cx]
+        parents: list [Cx_prev, Tx, Px]
+            Cx_prev: continuous previous-timestep damage
+            Tx:      continuous total loading
+            Px:      binary repair flag (0 = no repair, 1 = repair)
         """
         self.childs = childs
         self.parents = parents
@@ -275,55 +280,49 @@ class Cx:
     # ------------------------------------------------------------------
     def sample(self, Cs_pars):
         """
-        Cs_pars: (N, 2)
-            Cs_pars[:,0] = Tx value   (float)
-            Cs_pars[:,1] = Px index   (0 or 1)
-        
+        Cs_pars: (N, 3)
+            Cs_pars[:,0] = Cx_prev value  (float)
+            Cs_pars[:,1] = Tx value       (float)
+            Cs_pars[:,2] = Px index       (0 or 1)
+
         Returns:
-            Cx samples (N,)
+            Cs   : (N,) Cx samples
+            logp : (N,) zeros  (deterministic node)
         """
         Cs_pars = Cs_pars.to(self.device)
 
-        Tx_val = Cs_pars[:, 0]
-        Px_idx = Cs_pars[:, 1].long()
+        Cx_prev = Cs_pars[:, 0]
+        Tx_val  = Cs_pars[:, 1]
+        Px_idx  = Cs_pars[:, 2].long()
 
-        # Cx = Tx if Px==0, else 0
-        Cs = torch.where(Px_idx == 0, Tx_val, torch.zeros_like(Tx_val))
+        Cs = torch.where(Px_idx == 0, Cx_prev + Tx_val, torch.zeros_like(Tx_val))
+        logp = torch.zeros(Cs_pars.shape[0], device=self.device)
 
-        # deterministic function, i.e. P(Cx | Tx, Px) = 1
-        n_sample = Cs_pars.shape[0]
-        ps = torch.log(torch.ones(n_sample,)).to(self.device)
-
-        return Cs, ps
+        return Cs, logp
 
     # ------------------------------------------------------------------
     def log_prob(self, Cxs):
         """
-        Cxs: shape (N, 3)
-            Cxs[:,0] = Cx value
-            Cxs[:,1] = Tx value 
-            Cxs[:,2] = Px state (0 or 1) 
-        
-        Returns:
-            log p(Cx | Tx, Px) of shape (N,)
-        """
+        Cxs: shape (N, 4)
+            Cxs[:,0] = Cx value      (child)
+            Cxs[:,1] = Cx_prev value (parent 0)
+            Cxs[:,2] = Tx value      (parent 1)
+            Cxs[:,3] = Px state      (parent 2: 0 or 1)
 
+        Returns:
+            log p(Cx | Cx_prev, Tx, Px) of shape (N,)
+        """
         Cxs = Cxs.to(self.device)
 
-        Cx_val = Cxs[:, 0]
-        Tx_val = Cxs[:, 1]
-        Px_idx = Cxs[:, 2].long()
+        Cx_val  = Cxs[:, 0]
+        Cx_prev = Cxs[:, 1]
+        Tx_val  = Cxs[:, 2]
+        Px_idx  = Cxs[:, 3].long()
 
-        # Deterministic rule: valid_Cx = Tx if Px==0 else 0
-        expected_Cx = torch.where(Px_idx == 0, Tx_val, torch.zeros_like(Tx_val))
+        expected = torch.where(Px_idx == 0, Cx_prev + Tx_val, torch.zeros_like(Tx_val))
+        is_valid = torch.isclose(Cx_val, expected, rtol=1e-5, atol=1e-8)
 
-        # Valid if Cx_val == expected_Cx
-        is_valid = torch.isclose(Cx_val, expected_Cx, rtol=1e-5, atol=1e-8) # Add some acceptable error margin for floating point comparisons if needed.
-
-        # log 1 = 0 for valid, log 0 = -inf for invalid
-        logp = torch.where(is_valid, torch.zeros_like(Cx_val), torch.full_like(Cx_val, -float("inf")))
-
-        return logp
+        return torch.where(is_valid, torch.zeros_like(Cx_val), torch.full_like(Cx_val, -float("inf")))
 
 #Continuous - Crack location  | Cumulative damage, Resistance
 class Clx:
@@ -394,41 +393,40 @@ class Clx:
 
         return logp
 
-#Continuous - Resistance Rx|Z Rx = 1 + Zx
+#Continuous - Resistance Rx | Zx,  Rx = exp(Zx)
 class Rx:
     def __init__(self, childs, parents, device="cpu"):
         """
-        Rx = exp(Zx)  (deterministic; log-normal w.r.t. a Normal Zx)
+        Rx{t} = Rx{t-1} - exp(Zx{t})  (deterministic temporal update)
 
-        Always positive regardless of the sign of Zx.
+        exp(Zx) is always positive, ensuring the degradation subtracted
+        each timestep is strictly positive.
 
         childs  : [Variable Rx]
-        parents : [Variable Zx]
+        parents : [Variable Rx_prev, Variable Zx]
         """
         self.childs = childs
         self.parents = parents
         self.device = device
 
-        # parent variables
-        self.Zx = parents[0]
-
     # ------------------------------------------------------------------
-
     def sample(self, Cs_pars):
         """
-        Cs_pars : (N, 1)
-            Cs_pars[:,0] = Zx value
+        Cs_pars : (N, 2)
+            Cs_pars[:,0] = Rx_prev value
+            Cs_pars[:,1] = Zx value
 
         Returns
         -------
-        Cs   : (N,) Rx values (= exp(Zx))
-        logp : (N,) log p(Rx | Zx) — zero, deterministic node
+        Cs   : (N,) Rx = Rx_prev - exp(Zx)
+        logp : (N,) zeros  (deterministic node)
         """
         Cs_pars = Cs_pars.to(self.device)
 
-        Zx_val = Cs_pars[:, 0]
+        Rx_prev = Cs_pars[:, 0]
+        Zx_val  = Cs_pars[:, 1]
 
-        Cs   = torch.exp(Zx_val)
+        Cs   = Rx_prev - torch.exp(Zx_val)
         logp = torch.zeros_like(Cs)
 
         return Cs, logp
@@ -436,26 +434,82 @@ class Rx:
     # ------------------------------------------------------------------
     def log_prob(self, Cs):
         """
-        Cs : (N, 2)
-            Cs[:,0] = Rx value
-            Cs[:,1] = Zx value
+        Cs : (N, 3)
+            Cs[:,0] = Rx value      (child)
+            Cs[:,1] = Rx_prev value (parent 0)
+            Cs[:,2] = Zx value      (parent 1)
 
         Returns
         -------
-        log p(Rx | Zx) : (N,)
-            0    where Rx ≈ exp(Zx) (constraint satisfied)
+        log p(Rx | Rx_prev, Zx) : (N,)
+            0    where Rx ≈ Rx_prev - exp(Zx)
             -inf otherwise
         """
         Cs = Cs.to(self.device)
 
-        C_val  = Cs[:, 0]
-        Zx_val = Cs[:, 1]
+        Rx_val  = Cs[:, 0]
+        Rx_prev = Cs[:, 1]
+        Zx_val  = Cs[:, 2]
 
-        expected = torch.exp(Zx_val)
-        on_surface = torch.isclose(C_val, expected)
+        expected   = Rx_prev - torch.exp(Zx_val)
+        on_surface = torch.isclose(Rx_val, expected, rtol=1e-5, atol=1e-8)
         return torch.where(on_surface,
-                           torch.zeros_like(C_val),
-                           torch.full_like(C_val, -float("inf")))
+                           torch.zeros_like(Rx_val),
+                           torch.full_like(Rx_val, -float("inf")))
+
+#Continuous - Initial resistance at t=0 (root, log-normal)
+class Rx0:
+    def __init__(self, childs, parents=[], mean=0.0, sigma=1.0, device="cpu"):
+        """
+        Rx0 ~ LogNormal(mean, sigma)  # equivalent to exp(N(mean, sigma^2))
+
+        childs  : [Variable Rx0]
+        parents : [empty]
+        mean    : mean of the underlying Normal (float)
+        sigma   : std of the underlying Normal (float)
+        """
+        self.childs = childs
+        self.parents = parents
+        self.device = device
+
+        self.mean  = float(mean)
+        self.sigma = float(sigma)
+
+    # ------------------------------------------------------------------
+    def sample(self, n_sample):
+        """
+        n_sample : int
+
+        Returns
+        -------
+        Cs   : (n_sample,) sampled Rx0 values
+        logp : (n_sample,) log p(Rx0)
+        """
+        std  = torch.full((n_sample,), self.sigma, device=self.device)
+        mean = torch.full_like(std, self.mean)
+
+        dist = LogNormal(mean, std)
+        Cs   = dist.sample()
+        logp = dist.log_prob(Cs)
+
+        return Cs, logp
+
+    # ------------------------------------------------------------------
+    def log_prob(self, Cs):
+        """
+        Cs : (n_sample,)
+
+        Returns
+        -------
+        log p(Rx0) : (n_sample,)
+        """
+        Cs = Cs.to(self.device)
+
+        std  = torch.full_like(Cs, self.sigma)
+        mean = torch.full_like(Cs, self.mean)
+
+        dist = LogNormal(mean, std)
+        return dist.log_prob(Cs)
 
 #Continuous - Auxiliary variable Zx | Ux, Vx
 class Zx:
@@ -584,15 +638,15 @@ class Ux:
         dist = Normal(mean, std)
         return dist.log_prob(Cs)
 
-#Continuous - Latent unobservable gaussian unique to each location
-class Vx:
+#Continuous - Latent location factor at t=0 (root marginal)
+class Vx0:
     def __init__(self, childs, parents=[], sigma=0.2, device="cpu"):
         """
-        Vx ~ Normal(0, sigma^2)
+        Vx{loc}0 ~ Normal(0, sigma^2)   (root initialisation, marginal)
 
-        childs  : [Variable Vx]
+        childs  : [Variable Vx{loc}0]
         parents : [empty]
-        sigma   : noise std (float)
+        sigma   : marginal std (float)
         """
         self.childs = childs
         self.parents = parents
@@ -600,23 +654,91 @@ class Vx:
 
         self.sigma = float(sigma)
 
-
     # ------------------------------------------------------------------
     def sample(self, n_sample):
-        """
-        n_sample : int
-            number of samples to draw
-
-        Returns
-        -------
-        Cs   : (n_sample,) sampled Vx values
-        logp : (n_sample,) log p(Vx)
-        """
         mean = torch.zeros(n_sample, device=self.device)
         std  = torch.full((n_sample,), self.sigma, device=self.device)
 
         dist = Normal(mean, std)
+        Cs = dist.sample()
+        logp = dist.log_prob(Cs)
 
+        return Cs, logp
+
+    # ------------------------------------------------------------------
+    def log_prob(self, Cs):
+        Cs = Cs.to(self.device)
+
+        mean = torch.zeros_like(Cs)
+        std  = torch.full_like(Cs, self.sigma)
+
+        dist = Normal(mean, std)
+        return dist.log_prob(Cs)
+
+#Continuous - Latent location factor | previous timestep (AR(1) via precision matrix)
+class Vx:
+    def __init__(self, childs, parents, sigma=0.2, rho=0.2, device="cpu"):
+        """
+        Temporal link Vx{t} | Vx{t-1} derived from a bivariate Gaussian over
+        (Vx{t-1}, Vx{t}) with zero mean and covariance
+
+            Sigma = sigma^2 * [[1,   rho],
+                               [rho, 1  ]]
+
+        Conditioning via the precision matrix Lambda = Sigma^{-1}:
+
+            mean_{t|t-1} = mu_b - Lambda_bb^{-1} Lambda_ba (Vx{t-1} - mu_a)
+            var_{t|t-1}  = Lambda_bb^{-1}
+
+        With zero means this reduces to the AR(1) update
+            mean = rho * Vx{t-1},   var = sigma^2 (1 - rho^2)
+
+        so each timestep's prior mean is shifted toward the previous sampled
+        value (prior updating through the temporal direction).
+
+        childs  : [Variable Vx{t}]
+        parents : [Variable Vx{t-1}]
+        sigma   : marginal std of each Vx (float)
+        rho     : lag-1 correlation coefficient (float)
+        """
+        self.childs = childs
+        self.parents = parents
+        self.device = device
+        self.sigma = float(sigma)
+        self.rho = float(rho)
+
+        # Build covariance, invert to precision, derive conditional coefficients
+        var = self.sigma ** 2
+        Sigma = torch.tensor([[var,           self.rho * var],
+                              [self.rho * var, var          ]], dtype=torch.float64)
+        Lambda = torch.inverse(Sigma)
+        L_bb = Lambda[1, 1]
+        L_ba = Lambda[1, 0]
+        L_bb_inv = 1.0 / L_bb
+
+        # mean coefficient on (Vx{t-1} - mu_a); equals rho. var = sigma^2 (1 - rho^2)
+        self.b_coef   = float(-L_bb_inv * L_ba)
+        self.cond_var = float(L_bb_inv)
+        self.cond_std = float(self.cond_var ** 0.5)
+
+    # ------------------------------------------------------------------
+    def sample(self, Cs_pars):
+        """
+        Cs_pars : (N, 1)
+            Cs_pars[:,0] = Vx{t-1} value
+
+        Returns
+        -------
+        Cs   : (N,) Vx{t} ~ Normal(rho * Vx{t-1}, sigma^2 (1 - rho^2))
+        logp : (N,) log p(Vx{t} | Vx{t-1})
+        """
+        Cs_pars = Cs_pars.to(self.device)
+        Vx_prev = Cs_pars[:, 0]
+
+        mean = self.b_coef * Vx_prev          # mu_b = 0
+        std  = torch.full_like(Vx_prev, self.cond_std)
+
+        dist = Normal(mean, std)
         Cs = dist.sample()
         logp = dist.log_prob(Cs)
 
@@ -625,19 +747,23 @@ class Vx:
     # ------------------------------------------------------------------
     def log_prob(self, Cs):
         """
-        Cs : (n_sample, )
+        Cs : (N, 2)
+            Cs[:,0] = Vx{t} value
+            Cs[:,1] = Vx{t-1} value
 
         Returns
         -------
-        log p(Vx) : (n_sample,)
+        log p(Vx{t} | Vx{t-1}) : (N,)
         """
         Cs = Cs.to(self.device)
+        Vx_val  = Cs[:, 0]
+        Vx_prev = Cs[:, 1]
 
-        mean = torch.zeros_like(Cs)
-        std  = torch.full_like(Cs, self.sigma)
+        mean = self.b_coef * Vx_prev
+        std  = torch.full_like(Vx_val, self.cond_std)
 
         dist = Normal(mean, std)
-        return dist.log_prob(Cs)
+        return dist.log_prob(Vx_val)
 
 
 # Defining variables and probabilities
@@ -655,58 +781,90 @@ import torch
 
 device = ('cuda' if os.environ.get('USE_CUDA', '0') == '1' else 'cpu')
 
-def define_variables():
+def define_variables(n_locations=2, n_timesteps=5):
     varis = {}
 
-    varis['Wx'] = variable.Variable(name='Wx', values=(0, torch.inf))  # Continuous Half Normal
+    for loc in range(1, n_locations + 1):
+        # t=0 initialisation (per location): Cx, Vx and Rx
+        varis[f'Cx{loc}0'] = variable.Variable(name=f'Cx{loc}0', values=(0, torch.inf))
+        varis[f'Vx{loc}0'] = variable.Variable(name=f'Vx{loc}0', values=(-torch.inf, torch.inf))
+        varis[f'Rx{loc}0'] = variable.Variable(name=f'Rx{loc}0', values=(0, torch.inf))
 
-    varis['Lx'] = variable.Variable(name='Lx', values=(0, torch.inf))  # Continuous Half Normal
+        for t in range(1, n_timesteps + 1):
+            varis[f'Wx{loc}{t}']  = variable.Variable(name=f'Wx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Lx{loc}{t}']  = variable.Variable(name=f'Lx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Tx{loc}{t}']  = variable.Variable(name=f'Tx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Px{loc}{t}']  = variable.Variable(name=f'Px{loc}{t}',  values=['False', 'True'])
+            varis[f'Cx{loc}{t}']  = variable.Variable(name=f'Cx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Clx{loc}{t}'] = variable.Variable(name=f'Clx{loc}{t}', values=['False', 'True'])
+            varis[f'Rx{loc}{t}']  = variable.Variable(name=f'Rx{loc}{t}',  values=(0, torch.inf))
+            varis[f'Zx{loc}{t}']  = variable.Variable(name=f'Zx{loc}{t}',  values=(-torch.inf, torch.inf))
+            varis[f'Vx{loc}{t}']  = variable.Variable(name=f'Vx{loc}{t}',  values=(-torch.inf, torch.inf))
 
-    varis['Tx'] = variable.Variable(name='Tx', values=(0, torch.inf))  # Continuous Half Normal
-
-    varis['Cx'] = variable.Variable(name='Cx', values=(0, torch.inf))  # Continuous Half Normal
-
-    varis['Px'] = variable.Variable(name='Px', values=['False', 'True']) # Boolean 
-
-    varis['Cx0'] = variable.Variable(name='Cx0', values=(0, torch.inf))  # Continuous Half Normal
-
-    varis['Clx'] = variable.Variable(name='Clx', values=['False', 'True'])  # Boolean 
-
-    varis['Rx'] = variable.Variable(name='Rx', values=(0, torch.inf))  # Continuous Log Normal
-
-    varis['Zx'] = variable.Variable(name='Zx', values=(-torch.inf, torch.inf))  # Continuous Normal
-
-    varis['Ux'] = variable.Variable(name='Ux', values=(-torch.inf, torch.inf))  # Continuous Normal
-
-    varis['Vx'] = variable.Variable(name='Vx', values=(-torch.inf, torch.inf))  # Continuous Normal
+    # Ux is shared across locations, one per timestep
+    for t in range(1, n_timesteps + 1):
+        varis[f'Ux{t}'] = variable.Variable(name=f'Ux{t}', values=(-torch.inf, torch.inf))
 
     return varis
 
-def define_probs(varis, device='cpu'):
+def define_probs(varis, n_locations=2, n_timesteps=5, vx_sigma=0.2, vx_rho=0.2, device='cpu'):
     probs = {}
 
-    probs['Wx'] = Wx(childs=[varis['Wx']], device=device)
+    for loc in range(1, n_locations + 1):
+        # t=0 initialisation: Cx, Vx and Rx (root marginals)
+        probs[f'Cx{loc}0'] = Cx0(childs=[varis[f'Cx{loc}0']], device=device)
+        probs[f'Vx{loc}0'] = Vx0(childs=[varis[f'Vx{loc}0']], sigma=vx_sigma, device=device)
+        probs[f'Rx{loc}0'] = Rx0(childs=[varis[f'Rx{loc}0']], device=device)
 
-    probs['Lx'] = Lx(childs=[varis['Lx']], device=device)
+        for t in range(1, n_timesteps + 1):
+            probs[f'Wx{loc}{t}']  = Wx(childs=[varis[f'Wx{loc}{t}']], device=device)
+            probs[f'Lx{loc}{t}']  = Lx(childs=[varis[f'Lx{loc}{t}']], device=device)
+            probs[f'Tx{loc}{t}']  = Tx(childs=[varis[f'Tx{loc}{t}']],
+                parents=[varis[f'Wx{loc}{t}'], varis[f'Lx{loc}{t}']],
+                device=device,
+            )
+            probs[f'Px{loc}{t}']  = cpt.Cpt(
+                childs=[varis[f'Px{loc}{t}']],
+                C=np.array([[0], [1]]),
+                p=np.array([1.0, 0.0]),
+                device=device,
+            )
+            # Cx chains temporally: parent is Cx{loc}{t-1} (same location, previo
+            # us step)
+            probs[f'Cx{loc}{t}']  = Cx(
+                childs=[varis[f'Cx{loc}{t}']],
+                parents=[varis[f'Cx{loc}{t-1}'], varis[f'Tx{loc}{t}'], varis[f'Px{loc}{t}']],
+                device=device,
+            )
+            # Vx chains temporally: AR(1) link to Vx{loc}{t-1} via precision matrix
+            probs[f'Vx{loc}{t}']  = Vx(
+                childs=[varis[f'Vx{loc}{t}']],
+                parents=[varis[f'Vx{loc}{t-1}']],
+                sigma=vx_sigma,
+                rho=vx_rho,
+                device=device,
+            )
+            probs[f'Zx{loc}{t}']  = Zx(
+                childs=[varis[f'Zx{loc}{t}']],
+                parents=[varis[f'Ux{t}'], varis[f'Vx{loc}{t}']],
+                device=device,
+            )
+            # Rx chains temporally: Rx{t} = Rx{t-1} - Zx{t}
+            probs[f'Rx{loc}{t}']  = Rx(
+                childs=[varis[f'Rx{loc}{t}']],
+                parents=[varis[f'Rx{loc}{t-1}'], varis[f'Zx{loc}{t}']],
+                device=device,
+            )
+            probs[f'Clx{loc}{t}'] = Clx(
+                childs=[varis[f'Clx{loc}{t}']],
+                parents=[varis[f'Cx{loc}{t}'], varis[f'Rx{loc}{t}']],
+                device=device,
+            )
 
-    probs['Tx'] = Tx(childs=[varis['Tx']], parents=[varis['Wx'], varis['Lx']] , device=device)
+    # Ux: one per timestep (t>=1), shared across locations
+    for t in range(1, n_timesteps + 1):
+        probs[f'Ux{t}'] = Ux(childs=[varis[f'Ux{t}']], device=device)
 
-    probs['Cx'] = Cx(childs=[varis['Cx']], parents=[varis['Tx'], varis['Px']], device=device)
-
-    probs['Px'] = cpt.Cpt(childs=[varis['Px']], C=np.array([[0], [1]]), p=np.array([1.0, 0.0]), device=device) 
-
-    probs['Clx'] = Clx(childs=[varis['Clx']], parents=[varis['Cx'], varis['Rx']], device=device) 
-
-    probs['Cx0'] = Cx0(childs=[varis['Cx0']], device=device)
-
-    probs['Rx'] = Rx(childs=[varis['Rx']], parents=[varis['Zx']], device=device)
-
-    probs['Zx'] = Zx(childs=[varis['Zx']], parents=[varis['Ux'], varis['Vx']], device=device)
-
-    probs['Ux'] = Ux(childs=[varis['Ux']], device=device)
-
-    probs['Vx'] = Vx(childs=[varis['Vx']], device=device)
-    
     return probs
 
 # Inference
@@ -945,8 +1103,22 @@ def plot_prior_vs_posterior(prior, posterior, var, bins=60, fname: str = None):
 if __name__ == "__main__":
     device = "cuda" if os.environ.get("USE_CUDA", "0") == "1" else "cpu"
 
-    varis = define_variables()
-    probs = define_probs(varis, device=device)
+    n_locations = 2
+    n_timesteps = 5
+
+    # Vx temporal AR(1): marginal std and lag-1 correlation
+    vx_sigma = 0.2
+    vx_rho   = 0.2
+
+    varis = define_variables(n_locations=n_locations, n_timesteps=n_timesteps)
+    probs = define_probs(
+        varis,
+        n_locations=n_locations,
+        n_timesteps=n_timesteps,
+        vx_sigma=vx_sigma,
+        vx_rho=vx_rho,
+        device=device,
+    )
 
     # Prior distribution without evidence
     prior = sample_prior(probs, varis, n_sample=10_000)
