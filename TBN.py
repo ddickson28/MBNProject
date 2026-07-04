@@ -27,7 +27,7 @@ class TruncNormalPos:
 
 #Continuous - Weather Loading
 class Wx:
-    def __init__(self, childs, parents=[], mean=0.0, sigma=0.2, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=0.03, device="cpu"):
         """
         Wx ~ Log-Normal(0, 1) # equivalent to exp(N(0, 1))
 
@@ -87,7 +87,7 @@ class Wx:
 
 #Continuous - Cargo Loading
 class Lx:
-    def __init__(self, childs, parents=[], mean=0.0, sigma=0.2, device="cpu"):
+    def __init__(self, childs, parents=[], mean=0.0, sigma=0.03, device="cpu"):
         """
         Lx ~ Log-Normal(mean, sigma) # equivalent to exp(N(mean, sigma^2))
 
@@ -781,7 +781,16 @@ import torch
 
 device = ('cuda' if os.environ.get('USE_CUDA', '0') == '1' else 'cpu')
 
-def define_variables(n_locations=2, n_timesteps=5):
+def load_wx_lx_means(path):
+    """
+    Read CSV with columns Time, Wx_mean, Lx_mean.
+    Returns dict {t (int): (wx_mean, lx_mean)}.
+    """
+    df = pd.read_csv(path)
+    return {int(row.Time): (float(row.Wx_mean), float(row.Lx_mean))
+            for _, row in df.iterrows()}
+
+def define_variables(n_locations=16, n_timesteps=5):
     varis = {}
 
     for loc in range(1, n_locations + 1):
@@ -807,7 +816,7 @@ def define_variables(n_locations=2, n_timesteps=5):
 
     return varis
 
-def define_probs(varis, n_locations=2, n_timesteps=5, vx_sigma=0.2, vx_rho=0.2, device='cpu'):
+def define_probs(varis, n_locations=16, n_timesteps=5, vx_sigma=0.2, vx_rho=0.2, wx_lx_means=None, device='cpu'):
     probs = {}
 
     for loc in range(1, n_locations + 1):
@@ -817,8 +826,9 @@ def define_probs(varis, n_locations=2, n_timesteps=5, vx_sigma=0.2, vx_rho=0.2, 
         probs[f'Rx{loc}0'] = Rx0(childs=[varis[f'Rx{loc}0']], device=device)
 
         for t in range(1, n_timesteps + 1):
-            probs[f'Wx{loc}{t}']  = Wx(childs=[varis[f'Wx{loc}{t}']], device=device)
-            probs[f'Lx{loc}{t}']  = Lx(childs=[varis[f'Lx{loc}{t}']], device=device)
+            wx_mean, lx_mean = wx_lx_means[t] if wx_lx_means is not None else (1.0, 1.0)
+            probs[f'Wx{loc}{t}']  = Wx(childs=[varis[f'Wx{loc}{t}']], mean=np.log(wx_mean), device=device)
+            probs[f'Lx{loc}{t}']  = Lx(childs=[varis[f'Lx{loc}{t}']], mean=np.log(lx_mean), device=device)
             probs[f'Tx{loc}{t}']  = Tx(childs=[varis[f'Tx{loc}{t}']],
                 parents=[varis[f'Wx{loc}{t}'], varis[f'Lx{loc}{t}']],
                 device=device,
@@ -847,6 +857,7 @@ def define_probs(varis, n_locations=2, n_timesteps=5, vx_sigma=0.2, vx_rho=0.2, 
             probs[f'Zx{loc}{t}']  = Zx(
                 childs=[varis[f'Zx{loc}{t}']],
                 parents=[varis[f'Ux{t}'], varis[f'Vx{loc}{t}']],
+                rho=vx_rho,
                 device=device,
             )
             # Rx chains temporally: Rx{t} = Rx{t-1} - Zx{t}
@@ -1103,12 +1114,14 @@ def plot_prior_vs_posterior(prior, posterior, var, bins=60, fname: str = None):
 if __name__ == "__main__":
     device = "cuda" if os.environ.get("USE_CUDA", "0") == "1" else "cpu"
 
-    n_locations = 2
+    n_locations = 16
     n_timesteps = 5
 
     # Vx temporal AR(1): marginal std and lag-1 correlation
     vx_sigma = 0.2
     vx_rho   = 0.2
+
+    wx_lx_means = load_wx_lx_means('WxLxMeans.csv')
 
     varis = define_variables(n_locations=n_locations, n_timesteps=n_timesteps)
     probs = define_probs(
@@ -1117,18 +1130,19 @@ if __name__ == "__main__":
         n_timesteps=n_timesteps,
         vx_sigma=vx_sigma,
         vx_rho=vx_rho,
+        wx_lx_means=wx_lx_means,
         device=device,
     )
 
     # Prior distribution without evidence
-    prior = sample_prior(probs, varis, n_sample=10_000)
+    prior = sample_prior(probs, varis, n_sample=5_000)
 
     # --- TEMP: forward inference only, skip MCMC below -------------------
-    print("\nPrior summary (n=10,000 forward samples):")
+    print("\nWx / Lx prior sample summary (n=5,000 forward samples):")
+    print(f"  {'node':<12}  {'mean':>10}  {'std':>10}")
     for name, samples in prior.items():
-        print(f"  {name:>4}: mean={samples.mean():+.3f}  "
-              f"std={samples.std():.3f}  "
-              f"min={samples.min():+.3f}  max={samples.max():+.3f}")
+        if name.startswith('Wx') or name.startswith('Lx'):
+            print(f"  {name:<12}  {samples.mean():>10.6f}  {samples.std():>10.6f}")
 
     # Prior-only histograms (one PNG per variable in RESULTS folder)
     for name, samples in prior.items():
